@@ -1,0 +1,18 @@
+plate,plate_conf,vehicle_id,vehicle_class,violated,violation_type,frame,time_s,crop_path,plate_path
+WUIGIIQI0,0.12005886469175683,29,car,False,NONE,46,0.766,positive_crops/positive_f46_id29_car.jpg,positive_plate_crops/plate_f46_id29.jpg
+KL1N5510,0.07807706635702742,2,car,False,NONE,59,0.983,positive_crops/positive_f59_id2_car.jpg,positive_plate_crops/plate_f59_id2.jpg
+,0.0,117,motorcycle,False,NONE,86,1.432,positive_crops/positive_f86_id117_motorcycle.jpg,positive_plate_crops/plate_f86_id117.jpg
+KL22K9070,0.8255481140622017,6,truck,False,NONE,220,3.664,positive_crops/positive_f220_id6_truck.jpg,positive_plate_crops/plate_f220_id6.jpg
+,0.0,11,motorcycle,False,NONE,147,2.448,positive_crops/positive_f147_id11_motorcycle.jpg,positive_plate_crops/plate_f147_id11.jpg
+,0.0,338,vehicle,False,NONE,288,4.797,positive_crops/positive_f288_id338_vehicle.jpg,positive_plate_crops/plate_f288_id338.jpg
+,0.0,266,vehicle,False,NONE,290,4.83,positive_crops/positive_f290_id266_vehicle.jpg,positive_plate_crops/plate_f290_id266.jpg
+,0.0,366,vehicle,False,NONE,292,4.864,positive_crops/positive_f292_id366_vehicle.jpg,positive_plate_crops/plate_f292_id366.jpg
+,0.0,382,motorcycle,False,NONE,335,5.58,positive_crops/positive_f335_id382_motorcycle.jpg,positive_plate_crops/plate_f335_id382.jpg
+,0.0,3,car,False,NONE,418,6.862,,
+46J03,0.23262085181271341,313,truck,False,NONE,469,7.812,positive_crops/positive_f469_id313_truck.jpg,positive_plate_crops/plate_f469_id313.jpg
+,0.0,598,vehicle,False,NONE,504,8.395,positive_crops/positive_f504_id598_vehicle.jpg,positive_plate_crops/plate_f504_id598.jpg
+LLOICRGOGO,0.2773766520291202,557,car,False,NONE,633,10.543,positive_crops/positive_f633_id557_car.jpg,positive_plate_crops/plate_f633_id557.jpg
+,0.0,2569,vehicle,False,NONE,2337,38.926,positive_crops/positive_f2337_id2569_vehicle.jpg,positive_plate_crops/plate_f2337_id2569.jpg
+4L24 4885,0.4537208496862771,2101,car,False,NONE,2352,39.176,positive_crops/positive_f2352_id2101_car.jpg,positive_plate_crops/plate_f2352_id2101.jpg
+,0.0,2147,truck,False,NONE,2338,38.943,positive_crops/positive_f2338_id2147_truck.jpg,positive_plate_crops/plate_f2338_id2147.jpg
+,0.0,2450,motorcycle,False,NONE,2416,40.242,positive_crops/positive_f2416_id2450_motorcycle.jpg,positive_plate_crops/plate_f2416_id2450.jpg

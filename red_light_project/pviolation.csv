@@ -1,0 +1,5 @@
+plate,plate_conf,vehicle_id,vehicle_class,violated,violation_type,frame,time_s,crop_path,plate_path
+KL1AA5510,0.6876193361897622,2,car,False,NONE,59,0.983,positive_crops/positive_f59_id2_car.jpg,positive_plate_crops/plate_f59_id2.jpg
+KL22K9070,0.6151953433689318,6,truck,False,NONE,220,3.664,positive_crops/positive_f220_id6_truck.jpg,positive_plate_crops/plate_f220_id6.jpg
+KL01CN6O6O,0.7374083562330767,557,car,False,NONE,633,10.543,positive_crops/positive_f633_id557_car.jpg,positive_plate_crops/plate_f633_id557.jpg
+

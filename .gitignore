@@ -1,0 +1,20 @@
+venv/
+env/
+.venv/
+rl_env/
+red_light_project/venv/
+
+__pycache__/
+*.pyc
+
+*.mp4
+*.avi
+
+*.dll
+*.pyd
+*.lib
+
+# Secrets
+serviceAccountKey.json
+*.key.json
+.env

@@ -1,0 +1,739 @@
+"""
+red_light_pipeline.py
+
+Integrated pipeline:
+- YOLOv8 detection (vehicles + traffic lights)
+- Simple tracker (centroid + IoU) to keep IDs
+- GUI to click stop line on first frame
+- Detect red light (HSV heuristic on traffic light bbox)
+- When vehicle crosses stop line while light == red: run EasyOCR on vehicle crop to read plate
+- Save annotated output video and violations.csv + cropped plate images
+
+Usage:
+    python red_light_pipeline.py --source input_video.mp4 --out output_video.mp4 --show
+
+Requirements:
+    pip install numpy opencv-python pandas ultralytics easyocr filterpy scipy
+"""
+import os
+import sys
+
+# Workaround for OpenMP collision error on Windows
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import cv2
+import time
+import argparse
+import numpy as np
+import pandas as pd
+from ultralytics import YOLO
+import easyocr
+from collections import OrderedDict
+from scipy.spatial import distance
+
+# ---------------------------
+# Simple tracker combining centroid + IoU (keeps IDs)
+# ---------------------------
+class Tracker:
+    def __init__(self, max_disappeared=50, iou_threshold=0.3):
+        self.next_id = 0
+        self.objects = OrderedDict()  # id -> bbox (x1,y1,x2,y2)
+        self.disappeared = OrderedDict()  # id -> num frames disappeared
+        self.max_disappeared = max_disappeared
+        self.iou_threshold = iou_threshold
+
+    @staticmethod
+    def iou(bb1, bb2):
+        # bb = (x1,y1,x2,y2)
+        xA = max(bb1[0], bb2[0])
+        yA = max(bb1[1], bb2[1])
+        xB = min(bb1[2], bb2[2])
+        yB = min(bb1[3], bb2[3])
+        interW = max(0, xB - xA + 1)
+        interH = max(0, yB - yA + 1)
+        interArea = interW * interH
+        boxAArea = (bb1[2] - bb1[0] + 1) * (bb1[3] - bb1[1] + 1)
+        boxBArea = (bb2[2] - bb2[0] + 1) * (bb2[3] - bb2[1] + 1)
+        denom = float(boxAArea + boxBArea - interArea)
+        if denom <= 0:
+            return 0.0
+        return interArea / denom
+
+    def register(self, bbox):
+        self.objects[self.next_id] = bbox
+        self.disappeared[self.next_id] = 0
+        self.next_id += 1
+
+    def deregister(self, object_id):
+        del self.objects[object_id]
+        del self.disappeared[object_id]
+
+    def update(self, bboxes):
+        # bboxes: list of (x1,y1,x2,y2)
+        if len(bboxes) == 0:
+            # mark disappeared
+            for oid in list(self.disappeared.keys()):
+                self.disappeared[oid] += 1
+                if self.disappeared[oid] > self.max_disappeared:
+                    self.deregister(oid)
+            return self.objects
+
+        if len(self.objects) == 0:
+            for b in bboxes:
+                self.register(b)
+            return self.objects
+
+        # compute IoU distance matrix between existing objects and new boxes
+        object_ids = list(self.objects.keys())
+        object_boxes = [self.objects[oid] for oid in object_ids]
+
+        iou_matrix = np.zeros((len(object_boxes), len(bboxes)), dtype=np.float32)
+        for i, ob in enumerate(object_boxes):
+            for j, nb in enumerate(bboxes):
+                iou_matrix[i, j] = self.iou(ob, nb)
+
+        # greedily match largest IoU
+        matched_rows = set()
+        matched_cols = set()
+        matches = []
+
+        # flatten sorted by descending IoU
+        flat_indexes = np.argsort(iou_matrix.ravel())[::-1]
+        for idx in flat_indexes:
+            i = idx // iou_matrix.shape[1]
+            j = idx % iou_matrix.shape[1]
+            if i in matched_rows or j in matched_cols:
+                continue
+            if iou_matrix[i, j] < self.iou_threshold:
+                continue
+            matched_rows.add(i)
+            matched_cols.add(j)
+            matches.append((i, j))
+
+        # update matched
+        for (i, j) in matches:
+            oid = object_ids[i]
+            self.objects[oid] = bboxes[j]
+            self.disappeared[oid] = 0
+
+        # register unmatched new boxes
+        for j in range(len(bboxes)):
+            if j not in matched_cols:
+                self.register(bboxes[j])
+
+        # mark unmatched existing as disappeared
+        for i in range(len(object_boxes)):
+            if i not in matched_rows:
+                oid = object_ids[i]
+                self.disappeared[oid] += 1
+                if self.disappeared[oid] > self.max_disappeared:
+                    self.deregister(oid)
+
+        return self.objects
+
+# ---------------------------
+# Traffic light color detection (HSV heuristic)
+# ---------------------------
+def detect_light_color(crop):
+    # Returns 'red','green','yellow','unknown'
+    if crop is None or crop.size == 0:
+        return 'unknown'
+    
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    h, w = crop.shape[:2]
+    total = h * w
+
+    # Spatial Heuristic: Red is usually top, Green is usually bottom
+    # We'll weigh the areas based on their position
+    
+    # red mask (two ranges)
+    lower1 = np.array([0, 100, 50]); upper1 = np.array([10, 255, 255])
+    lower2 = np.array([160, 100, 50]); upper2 = np.array([179, 255, 255])
+    mask1 = cv2.inRange(hsv, lower1, upper1)
+    mask2 = cv2.inRange(hsv, lower2, upper2)
+    red_mask = cv2.bitwise_or(mask1, mask2)
+
+    # green mask
+    lower_g = np.array([40, 70, 50]); upper_g = np.array([90, 255, 255])
+    green_mask = cv2.inRange(hsv, lower_g, upper_g)
+
+    # Calculate areas in vertical slices
+    # Red should be in top 2/3, Green in bottom 2/3
+    top_half_red = cv2.countNonZero(red_mask[:int(h*0.66), :])
+    bottom_half_green = cv2.countNonZero(green_mask[int(h*0.33):, :])
+
+    # thresholds (percentage of crop)
+    if top_half_red > 0.03 * total and top_half_red > bottom_half_green:
+        return 'red'
+    if bottom_half_green > 0.03 * total and bottom_half_green > top_half_red:
+        return 'green'
+    return 'unknown'
+
+# ---------------------------
+# Helper: get centroid
+# ---------------------------
+def bbox_centroid(bbox):
+    x1, y1, x2, y2 = bbox
+    return int((x1 + x2) / 2), int((y1 + y2) / 2)
+
+# ---------------------------
+# Robust Zone Helpers (Lines & Vectors)
+# ---------------------------
+def intersect(p1, p2, p3, p4):
+    """
+    Returns True if line segment p1p2 and p3p4 intersect.
+    """
+    def ccw(A, B, C):
+        return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+    return ccw(p1,p3,p4) != ccw(p2,p3,p4) and ccw(p1,p2,p3) != ccw(p1,p2,p4)
+
+def is_inside_zone(p, zone_pts):
+    """
+    Checks if point p=(x,y) is inside the polygon zone.
+    """
+    res = cv2.pointPolygonTest(zone_pts, (float(p[0]), float(p[1])), False)
+    return res >= 0
+
+def has_crossed_edge(p_prev, p_curr, zone_pts):
+    """
+    Returns True if the path from p_prev to p_curr intersects any edge of the zone.
+    """
+    for i in range(len(zone_pts)):
+        p1 = zone_pts[i]
+        p2 = zone_pts[(i + 1) % len(zone_pts)]
+        if intersect(p_prev, p_curr, p1, p2):
+            return True
+    return False
+
+# ---------------------------
+# GUI to let the user click stop line
+# ---------------------------
+click_points = []
+frame_for_click = None
+
+def click_event(event, x, y, flags, param):
+    global click_points, frame_for_click
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if len(click_points) < 4:
+            click_points.append((x, y))
+            # draw point
+            cv2.circle(frame_for_click, (x, y), 5, (0, 255, 255), -1)
+            # draw lines as we go
+            if len(click_points) > 1:
+                cv2.line(frame_for_click, click_points[-2], click_points[-1], (255, 255, 0), 2)
+            if len(click_points) == 4:
+                cv2.line(frame_for_click, click_points[3], click_points[0], (255, 255, 0), 2)
+            
+            cv2.imshow("Select stop zone - press 's' when done", frame_for_click)
+
+# ---------------------------
+# Main pipeline
+# ---------------------------
+def main(args):
+    source = args.source
+    out_path = args.out
+    show = args.show
+    scale = args.scale
+    out_width = args.out_width
+    out_height = args.out_height
+
+    os.makedirs("violation_crops", exist_ok=True)
+    os.makedirs("plate_crops", exist_ok=True)
+
+    # Load YOLOv8 model (yolov8s.pt is larger and more accurate than yolov8n)
+    print("Loading YOLOv8 model (yolov8s)...")
+    model = YOLO("yolov8s.pt")  # first run may download weights
+    # Load Helmet model (helmet.pt)
+    # Classes: {0: 'With Helmet', 1: 'Without Helmet'}
+    print("Loading Helmet model (helmet.pt)...")
+    helmet_model = YOLO("helmet.pt")
+    # Load License Plate model (plate.pt)
+    print("Loading Plate model (plate.pt)...")
+    plate_model = YOLO("plate.pt")
+
+    # Initialize EasyOCR reader (English + numbers, adjust languages if needed)
+    print("Loading EasyOCR (this may take a moment on first run)...")
+    reader = easyocr.Reader(['en'], gpu=True)  # use english; it recognizes digits/letter
+    
+
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        print("ERROR: cannot open video:", source)
+        return
+    
+    
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
+
+    # Calculate output resolution based on user input
+    original_W, original_H = W, H
+    
+    if scale != 1.0:
+        W = int(W * scale)
+        H = int(H * scale)
+        print(f"Applied scale factor: {scale}x -> {W}x{H}")
+    
+    if out_width is not None and out_height is not None:
+        W, H = out_width, out_height
+        print(f"Using explicit output size: {W}x{H}")
+    elif out_width is not None:
+        # maintain aspect ratio, scale based on width
+        ratio = out_width / original_W
+        W = out_width
+        H = int(original_H * ratio)
+        print(f"Using output width {W}, height auto-scaled to {H} (maintains aspect ratio)")
+    elif out_height is not None:
+        # maintain aspect ratio, scale based on height
+        ratio = out_height / original_H
+        H = out_height
+        W = int(original_W * ratio)
+        print(f"Using output height {H}, width auto-scaled to {W} (maintains aspect ratio)")
+
+    # Read first frame to allow user to click stop line
+    global frame_for_click, click_points
+    click_points = []
+    ret, frame_for_click = cap.read()
+    if not ret:
+        print("ERROR: empty video.")
+        return
+
+    # Resize first frame if needed for display
+    if frame_for_click.shape[1] != W or frame_for_click.shape[0] != H:
+        frame_for_click = cv2.resize(frame_for_click, (W, H), interpolation=cv2.INTER_LINEAR)
+
+    disp = frame_for_click.copy()
+    cv2.putText(disp, "Click FOUR points to define stop zone. Press 's' when done", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+    cv2.namedWindow("Select stop zone - press 's' when done", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Select stop zone - press 's' when done", 1280, 720)
+    cv2.imshow("Select stop zone - press 's' when done", disp)
+    cv2.setMouseCallback("Select stop zone - press 's' when done", click_event)
+
+    # wait for four clicks and 's' key
+    while True:
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('s') and len(click_points) >= 4:
+            break
+        if key == ord('q'):
+            print("Quitting stop-zone selection.")
+            cap.release()
+            cv2.destroyAllWindows()
+            return
+    cv2.destroyAllWindows()
+    stop_zone_pts = np.array(click_points, dtype=np.int32)
+    print("Stop zone set to:", click_points)
+
+    # Reposition capture to start
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    # Video writer with quality settings
+    # Use fallback codecs - try mp4v (most compatible) first, then MJPG as backup
+    print(f"\n=== Creating video writer ===")
+    print(f"Input resolution: {original_W}x{original_H}")
+    print(f"Output resolution: {W}x{H}")
+    print(f"FPS: {fps:.1f}")
+    print(f"Trying codecs...")
+    
+    codecs_to_try = ["mp4v", "MJPG", "DIVX"]
+    writer = None
+    used_codec = None
+    
+    for codec_name in codecs_to_try:
+        fourcc = cv2.VideoWriter_fourcc(*codec_name)
+        test_writer = cv2.VideoWriter(out_path, fourcc, fps, (W, H))
+        if test_writer.isOpened():
+            writer = test_writer
+            used_codec = codec_name
+            print(f"✓ SUCCESS: Using codec {used_codec}")
+            break
+        else:
+            print(f"✗ {codec_name} failed")
+        test_writer.release()
+    
+    if writer is None:
+        print(f"\n❌ ERROR: Could not create video writer with any codec!")
+        print(f"Tried: {codecs_to_try}")
+        cap.release()
+        return
+    
+    print(f"=== Starting frame processing ===\n")
+
+    if show:
+        cv2.namedWindow("Output", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Output", 1280, 720)
+
+    violations = []  # list dicts: plate, vehicle_id, frame, time_s, violated, crop_path, plate_text, plate_conf, violation_type
+    vehicle_flagged = {}  # id -> whether we've already reported this crossing (to avoid dup)
+    
+    # Temporal Smoothing & Stability
+    light_history = []   # recent light states
+    plate_candidates = {} # id -> list of (text, conf)
+    red_light_start_frame = -1
+    RED_LIGHT_BUFFER = 3 # frames light must be red to count
+    
+    # Active Zone Tracking (Continuous Plate Refinement)
+    # id -> { 'best_p_crop': None, 'best_p_conf': 0, 'best_v_crop': None, 'violated': False, 
+    #         'v_type': set(), 'best_frame': 0, 'best_time': 0, 'last_seen': 0 }
+    active_zone_tracks = {} 
+    
+    # Motion filtering
+    vehicle_history = {} # id -> list of recent centroids
+    MOTION_THRESHOLD = 5.0 # pixels moved to be considered "moving"
+    HISTORY_LEN = 10 # frames to check history
+
+    frame_idx = 0
+    t0 = time.time()
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Resize frame if output resolution differs from input
+        frame_h, frame_w = frame.shape[:2]
+        if frame_w != W or frame_h != H:
+            frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_LINEAR)
+        
+        frame_idx += 1
+        annotated_frame = frame.copy()
+        timestamp = frame_idx / fps
+
+        # Run YOLO inference with tracking
+        # persist=True keeps IDs across frames using built-in ByteTrack
+        results = model.track(frame, imgsz=1024, persist=True, verbose=False)
+        
+        if results[0].boxes.id is None:
+            # Handle case with no tracked objects
+            dets = results[0].boxes
+            tracked_ids = []
+        else:
+            dets = results[0].boxes
+            tracked_ids = dets.id.cpu().numpy().astype(int)
+            
+        names = results[0].names
+
+        vehicle_data = {} # id -> {bbox, cls_name}
+        traffic_light_bboxes = []
+
+        # Parse detections and tracking
+        for i, (box, cls, conf) in enumerate(zip(dets.xyxy, dets.cls, dets.conf)):
+            x1, y1, x2, y2 = [int(v) for v in box.tolist()]
+            cls_id = int(cls.item())
+            name = names[cls_id].lower()
+            
+            if name in ("car", "truck", "bus", "motorbike", "motorcycle", "bicycle", "van", "pickup"):
+                if i < len(tracked_ids):
+                    tid = int(tracked_ids[i])
+                    vehicle_data[tid] = {"bbox": (x1, y1, x2, y2), "name": name}
+            elif name in ("traffic light", "traffic_light", "signal", "traffic_sign"):
+                traffic_light_bboxes.append((x1, y1, x2, y2))
+
+        print(f"Frame {frame_idx}: Detected {len(vehicle_data)} vehicles, {len(traffic_light_bboxes)} traffic lights")
+
+        # Determine traffic light state (simple majority + prefer red)
+        light_states = []
+        for i, (x1, y1, x2, y2) in enumerate(traffic_light_bboxes):
+            pad = 3
+            xx1 = max(0, x1 - pad); yy1 = max(0, y1 - pad)
+            xx2 = min(W - 1, x2 + pad); yy2 = min(H - 1, y2 + pad)
+            crop = frame[yy1:yy2, xx1:xx2]
+            state = detect_light_color(crop)
+            light_states.append(state)
+            
+            # Debug: Save traffic light crop occasionally (e.g. every 30 frames)
+            if frame_idx % 30 == 0:
+                 os.makedirs("debug_lights", exist_ok=True)
+                 cv2.imwrite(f"debug_lights/light_{frame_idx}_{i}_{state}.jpg", crop)
+
+        if len(light_states) == 0:
+            current_light = 'unknown'
+        else:
+            if 'red' in light_states:
+                current_light = 'red'
+            elif 'green' in light_states:
+                current_light = 'green'
+            else:
+                current_light = 'unknown'
+
+        print(f"Light states: {light_states}, Current light: {current_light}")
+
+        # Smooth traffic light state
+        light_history.append(current_light)
+        if len(light_history) > 5: light_history.pop(0)
+        
+        # Majority vote for light
+        if len(light_history) > 0:
+            current_light = max(set(light_history), key=light_history.count)
+        
+        # Red light persistence
+        if current_light == 'red':
+            if red_light_start_frame == -1: red_light_start_frame = frame_idx
+        else:
+            red_light_start_frame = -1
+            
+        validated_red = (red_light_start_frame != -1 and (frame_idx - red_light_start_frame) >= RED_LIGHT_BUFFER)
+            
+        # Draw stop zone
+        cv2.polylines(annotated_frame, [stop_zone_pts], isClosed=True, color=(0, 255, 255), thickness=2)
+        if current_light == 'red':
+            overlay = annotated_frame.copy()
+            cv2.fillPoly(overlay, [stop_zone_pts], (0, 0, 100)) # faint red
+            cv2.addWeighted(overlay, 0.3, annotated_frame, 0.7, 0, annotated_frame)
+
+        cv2.putText(annotated_frame, f"Light: {current_light}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (0, 0, 255) if current_light == 'red' else (0, 255, 0), 2)
+
+        # Process each tracked object
+        for oid, vinfo in vehicle_data.items():
+            bbox = vinfo["bbox"]
+            v_cls = vinfo["name"]
+            x1, y1, x2, y2 = bbox
+            cX, cY = bbox_centroid(bbox)
+            
+            # Center logic: use the bottom-center of the bounding box
+            bottom_center = (cX, y2)
+
+            # --- Motion Detection ---
+            if oid not in vehicle_history:
+                vehicle_history[oid] = []
+            vehicle_history[oid].append((cX, cY))
+            if len(vehicle_history[oid]) > HISTORY_LEN:
+                vehicle_history[oid].pop(0)
+
+            is_moving = False
+            if len(vehicle_history[oid]) > 1:
+                dist = distance.euclidean(vehicle_history[oid][0], vehicle_history[oid][-1])
+                if dist > MOTION_THRESHOLD: is_moving = True
+            else:
+                is_moving = True 
+            
+            # Draw bounding box + ID ONLY if moving
+            if is_moving:
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 128, 0), 2)
+                cv2.putText(annotated_frame, f"{v_cls.upper()} ID:{oid}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
+            # --- Robust Zone Logic (Path-Aware) ---
+            # Current marker
+            bottom_center = (cX, y2)
+            
+            # Previous marker
+            prev_bottom_center = None
+            if oid in vehicle_history and len(vehicle_history[oid]) > 1:
+                # Need the second to last because the last one is the current one we just added
+                p_x, p_y = vehicle_history[oid][-2]
+                # Assuming y2 doesn't change drastically between frames for the purpose of a crossing line
+                # But let's be more precise if we tracked the y2 specifically? 
+                # For simplicity, we use the centroid history to estimate the marker history
+                # cY to y2 offset:
+                offset_y = y2 - cY
+                prev_bottom_center = (int(p_x), int(p_y + offset_y))
+
+            is_in_now = is_inside_zone(bottom_center, stop_zone_pts)
+            
+            # Start/Continue tracking if inside or if path crossed an edge
+            just_entered = False
+            if is_in_now and oid not in active_zone_tracks:
+                just_entered = True
+            elif not is_in_now and prev_bottom_center and has_crossed_edge(prev_bottom_center, bottom_center, stop_zone_pts):
+                # Even if not "inside" now, it crossed a line this frame
+                if oid not in active_zone_tracks:
+                    just_entered = True
+
+            if just_entered:
+                active_zone_tracks[oid] = {
+                    "best_p_crop": None,
+                    "best_p_conf": 0.0,
+                    "best_v_crop": None,
+                    "violated": False,
+                    "v_type": set(),
+                    "best_frame": frame_idx,
+                    "best_time": timestamp,
+                    "last_seen": frame_idx,
+                    "in_zone_frames": 0
+                }
+                print(f"Vehicle {oid} ENTERED stop zone at frame {frame_idx}")
+
+            if oid in active_zone_tracks:
+                track = active_zone_tracks[oid]
+                track["last_seen"] = frame_idx
+                track["in_zone_frames"] += 1
+                
+                # Update Violation Status
+                is_red_light = validated_red
+                is_helmet_violation = False
+                
+                padw = int((x2 - x1) * 0.15); padh = int((y2 - y1) * 0.15)
+                cx1 = max(0, x1 - padw); cy1 = max(0, y1 - padh)
+                cx2 = min(W - 1, x2 + padw); cy2 = min(H - 1, y2 + padh)
+                vehicle_crop = frame[cy1:cy2, cx1:cx2].copy()
+
+                if v_cls in ("motorbike", "motorcycle", "bicycle", "scooter"):
+                    h_results = helmet_model(vehicle_crop, verbose=False, conf=0.20) 
+                    for h_box, h_cls, h_conf in zip(h_results[0].boxes.xyxy, h_results[0].boxes.cls, h_results[0].boxes.conf):
+                        if int(h_cls.item()) == 1: # Without Helmet
+                            is_helmet_violation = True
+                            mx1, my1, mx2, my2 = [int(v) for v in h_box.tolist()]
+                            abs_x1, abs_y1 = cx1 + mx1, cy1 + my1
+                            abs_x2, abs_y2 = cx1 + mx2, cy1 + my2
+                            cv2.rectangle(annotated_frame, (abs_x1, abs_y1), (abs_x2, abs_y2), (0, 0, 255), 3)
+                            cv2.putText(annotated_frame, f"No Helmet {float(h_conf.item()):.2f}", (abs_x1, abs_y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+
+                if is_red_light: track["v_type"].add("RED_LIGHT")
+                if is_helmet_violation: track["v_type"].add("NO_HELMET")
+                if is_red_light or is_helmet_violation: track["violated"] = True
+                
+                # Continuous Plate Refinement (Scanning the lines/area)
+                plate_results = plate_model(vehicle_crop, verbose=False, conf=0.3)
+                if len(plate_results[0].boxes) > 0:
+                    best_p = max(plate_results[0].boxes, key=lambda x: x.conf.item())
+                    p_conf = best_p.conf.item()
+                    if p_conf > track["best_p_conf"]:
+                        px1, py1, px2, py2 = [int(v) for v in best_p.xyxy[0].tolist()]
+                        pp = 4 # slightly more padding for refinement
+                        vh, vw = vehicle_crop.shape[:2]
+                        ppx1, ppy1 = max(0, px1-pp), max(0, py1-pp)
+                        ppx2, ppy2 = min(vw-1, px2+pp), min(vh-1, py2+pp)
+                        
+                        track["best_p_crop"] = vehicle_crop[ppy1:ppy2, ppx1:ppx2].copy()
+                        track["best_p_conf"] = p_conf
+                        track["best_v_crop"] = vehicle_crop
+                        track["best_frame"] = frame_idx
+                        track["best_time"] = timestamp
+                
+                # Feedback
+                cv2.putText(annotated_frame, f"SCANNING: {track['best_p_conf']:.2f}", (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.circle(annotated_frame, bottom_center, 5, (0, 255, 0), -1)
+
+        # --- Finalize Zone Exits (Considering the Lines) ---
+        ids_to_finalize = []
+        for oid, track in active_zone_tracks.items():
+            # Check if still logically "inside"
+            # We check if track was lost OR if it moved outside and DID NOT cross an edge back in (though usually just leaving is enough)
+            bx1, by1, bx2, by2 = (0,0,0,0)
+            in_now = False
+            last_p = None
+            curr_p = None
+            
+            if oid in vehicle_data:
+                bbox = vehicle_data[oid]["bbox"]
+                bx1, by1, bx2, by2 = bbox
+                cbX, cbY = bbox_centroid(bbox)
+                curr_p = (cbX, by2)
+                in_now = is_inside_zone(curr_p, stop_zone_pts)
+                
+                if oid in vehicle_history and len(vehicle_history[oid]) > 1:
+                    px, py = vehicle_history[oid][-2]
+                    offset_y = by2 - cbY
+                    last_p = (int(px), int(py + offset_y))
+
+            # Logic for Exit:
+            # 1. Not detected this frame (track lost)
+            # 2. Was inside/crossing, now outside AND not crossing an entry line again
+            should_exit = False
+            if track["last_seen"] < frame_idx:
+                should_exit = True
+            elif not in_now:
+                # If we are now outside, we "exited" unless we somehow just jumped out without crossing a line (occlusion)
+                # But typically, if you are OUT, you are OUT.
+                should_exit = True
+
+            if should_exit:
+                ids_to_finalize.append(oid)
+        
+        for oid in ids_to_finalize:
+            track = active_zone_tracks.pop(oid)
+            if not vehicle_flagged.get(oid, False):
+                # Process best capture from entire transit
+                plate_text = ""
+                plate_conf = 0.0
+                
+                if track["best_p_crop"] is not None:
+                    try:
+                        gray = cv2.cvtColor(track["best_p_crop"], cv2.COLOR_BGR2GRAY)
+                        # Multi-pass enhancement
+                        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+                        sharpened = cv2.filter2D(gray, -1, kernel)
+                        proc = cv2.adaptiveThreshold(sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+                        
+                        best_read = None
+                        for img in [proc, sharpened, gray]:
+                            res = reader.readtext(img)
+                            if res:
+                                cur_best = max(res, key=lambda x: x[2])
+                                if best_read is None or cur_best[2] > best_read[2]:
+                                    best_read = cur_best
+                        
+                        if best_read:
+                            plate_text = best_read[1].replace(".", "").replace(":", "").replace("-", "").strip().upper()
+                            plate_conf = float(best_read[2])
+                    except Exception as e:
+                        print(f"Deferred OCR error for ID {oid}:", e)
+
+                violated = track["violated"]
+                crop_path = ""
+                if violated and track["best_v_crop"] is not None:
+                    # use the best vehicle class from current frame info if still exists, else use track start
+                    v_cls = vehicle_data[oid]["name"] if oid in vehicle_data else "vehicle"
+                    crop_path = f"violation_crops/violation_f{track['best_frame']}_id{oid}_{v_cls}.jpg"
+                    cv2.imwrite(crop_path, track["best_v_crop"])
+                    
+                    plate_crop_path = f"plate_crops/plate_f{track['best_frame']}_id{oid}.jpg"
+                    cv2.imwrite(plate_crop_path, track["best_p_crop"])
+
+                v_type_str = "+".join(track["v_type"]) if track["v_type"] else "NONE"
+                
+                violations.append({
+                    "plate": plate_text,
+                    "plate_conf": plate_conf,
+                    "vehicle_id": oid,
+                    "vehicle_class": vehicle_data[oid]["name"] if oid in vehicle_data else "vehicle",
+                    "violated": bool(violated),
+                    "violation_type": v_type_str,
+                    "frame": track["best_frame"],
+                    "time_s": round(track["best_time"], 3),
+                    "crop_path": crop_path
+                })
+                vehicle_flagged[oid] = True
+                print(f"EXIT: Vehicle {oid} finalized. Violated: {violated}. Plate: {plate_text}")
+
+        # draw traffic light bboxes for debugging
+        for (x1, y1, x2, y2) in traffic_light_bboxes:
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 200, 200), 2)
+
+        writer.write(annotated_frame)
+        if show:
+            cv2.imshow("Output", annotated_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    cap.release()
+    writer.release()
+    if show:
+        cv2.destroyAllWindows()
+
+    # Save violations CSV (Reordered)
+    if len(violations) > 0:
+        # Define prioritized column order
+        cols = ["plate", "plate_conf", "vehicle_id", "vehicle_class", "violated", "violation_type", "frame", "time_s", "crop_path"]
+        df = pd.DataFrame(violations)
+        # Reorder to match prioritized list, keeping only existing columns to be safe
+        existing_cols = [c for c in cols if c in df.columns]
+        df = df[existing_cols]
+        
+        df.to_csv("violations.csv", index=False)
+        print("Saved violations.csv and crop images.")
+    else:
+        print("No violations recorded. CSV not created.")
+
+    elapsed = time.time() - t0
+    print(f"Done. Frames processed: {frame_idx}. Time: {elapsed:.1f}s. Avg FPS: {frame_idx/elapsed:.2f}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", required=True, help="path to input video")
+    parser.add_argument("--out", default="output_video.mp4", help="output annotated video path")
+    parser.add_argument("--show", action="store_true", help="show live window")
+    parser.add_argument("--out_width", type=int, default=None, help="output video width (optional, maintains aspect ratio if height not specified)")
+    parser.add_argument("--out_height", type=int, default=None, help="output video height (optional, maintains aspect ratio if width not specified)")
+    parser.add_argument("--scale", type=float, default=1.0, help="scale factor for output (e.g., 0.5 for half size, 2.0 for double size)")
+    args = parser.parse_args()
+    main(args)

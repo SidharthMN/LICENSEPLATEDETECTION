@@ -1,0 +1,11 @@
+plate,plate_conf,vehicle_id,frame,time_s,violated,crop_path
+,0.0,0,38,1.517,False,
+KL74B9512,0.5709844222136798,88,384,15.334,True,violation_crops/violation_f384_id88.jpg
+KL01BA2798,0.13633907415981136,116,470,18.768,True,violation_crops/violation_f470_id116.jpg
+KL01CS3559,0.003428388675938043,129,505,20.166,True,violation_crops/violation_f505_id129.jpg
+,0.0,127,567,22.641,True,violation_crops/violation_f567_id127.jpg
+,0.0,124,614,24.518,False,
+,0.0,147,658,26.275,False,
+,0.0,142,730,29.15,False,
+,0.0,170,831,33.183,False,
+,0.0,217,935,37.336,False,

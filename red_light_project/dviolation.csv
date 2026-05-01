@@ -1,0 +1,6 @@
+plate,plate_conf,vehicle_id,vehicle_class,violated,violation_type,frame,time_s,crop_path,plate_path
+KL01DA4104,0.4583027594619327,1306,motorcycle,True,NO_HELMET+RED_LIGHT,1101,18.339,violation_crops/violation_f1101_id1306_motorcycle.jpg,plate_crops/plate_f1101_id1306.jpg
+KL01BV8718,0.7365749733788627,1333,car,True,RED_LIGHT,1151,19.171,violation_crops/violation_f1151_id1333_car.jpg,plate_crops/plate_f1151_id1333.jpg
+KL01AZ4777,0.5805220031738281,1573,car,True,RED_LIGHT,1598,26.617,violation_crops/violation_f1598_id1573_car.jpg,plate_crops/plate_f1598_id1573.jpg
+KL01CP9302,0.7262184940851651,1498,car,True,RED_LIGHT,1727,28.766,violation_crops/violation_f1727_id1498_car.jpg,plate_crops/plate_f1727_id1498.jpg
+KL20R0338,0.7216968139012655,1800,car,True,RED_LIGHT,2088,34.778,violation_crops/violation_f2088_id1800_car.jpg,plate_crops/plate_f2088_id1800.jpg
