@@ -42,8 +42,8 @@ An AI-powered automated traffic violation detection backend system using Compute
 2. **Set up the Conda Environment:**
 
    ```bash
-   conda create --name rl_env python=3.12
-   conda activate rl_env
+   conda create --name condaenv python=3.12
+   conda activate condaenv
    ```
 
 3. **Install Dependencies:**
