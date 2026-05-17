@@ -1,8 +1,10 @@
-opencv-python
-numpy
-pandas
-ultralytics
-paddlepaddle
-paddleocr
-scipy
-filterpy
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+easyocr==1.7.2
+numpy==1.26.4
+opencv-python==4.10.0.84
+pandas==2.2.3
+torch
+torchvision
+ultralytics==8.4.51
+scipy==1.15.3

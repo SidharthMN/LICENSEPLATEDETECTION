@@ -1,2 +1,2 @@
-firebase-admin
-pandas
+firebase_admin==7.4.0
+pandas==3.0.3

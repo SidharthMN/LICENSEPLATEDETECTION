@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Traffic Light</title>
+    <style>
+        body {
+            margin: 0;
+            background: black;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+
+        .traffic-light {
+            width: 120px;
+            background: #222;
+            padding: 20px;
+            border-radius: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .light {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            background: #111;
+            opacity: 0.3;
+            margin: auto;
+        }
+
+        .red.active {
+            background: red;
+            opacity: 1;
+        }
+
+        .yellow.active {
+            background: yellow;
+            opacity: 1;
+        }
+
+        .green.active {
+            background: green;
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+
+<div class="traffic-light">
+    <div class="light red" id="red"></div>
+    <div class="light yellow" id="yellow"></div>
+    <div class="light green" id="green"></div>
+</div>
+
+<script>
+    const red = document.getElementById("red");
+    const yellow = document.getElementById("yellow");
+    const green = document.getElementById("green");
+
+    function clearLights() {
+        red.classList.remove("active");
+        yellow.classList.remove("active");
+        green.classList.remove("active");
+    }
+
+    function startTrafficLight() {
+        // GREEN for 20 sec
+        clearLights();
+        green.classList.add("active");
+
+        setTimeout(() => {
+            // YELLOW for 5 sec
+            clearLights();
+            yellow.classList.add("active");
+
+            setTimeout(() => {
+                // RED for 20 sec
+                clearLights();
+                red.classList.add("active");
+
+                setTimeout(() => {
+                    startTrafficLight(); // Loop again
+                }, 20000);
+
+            }, 5000);
+
+        }, 20000);
+    }
+
+    startTrafficLight();
+</script>
+
+</body>
+</html>
